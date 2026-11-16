@@ -50,12 +50,54 @@ def test_available_connections_too_much_releases():
 def test_parse_pasv_response():
     p = aioftp.Client.parse_pasv_response
     assert p("(192,168,1,0,1,0)") == ("192.168.1.0", 256)
+    assert p("227 listen (127,0,0,1,222,120)") == ("127.0.0.1", 56952)
+
+
+def test_parse_pasv_response_strict_rejects_malformed():
+    p = aioftp.Client.parse_pasv_response
+    bad_responses = (
+        "227 no parentheses here",
+        "227 (192,168,1,0,1)",  # five fields
+        "227 (192,168,1,0,1,0,5)",  # seven fields
+        "227 (192,168,1,x,1,0)",  # non-numeric field
+        "227 (256,168,1,0,1,0)",  # integer above 255
+        "227 (192,168,1,0,0,0)",  # zero port
+        "227 (192,168,1,0,255,256)",  # port above 65535 (255*256+256)
+    )
+    for response in bad_responses:
+        with pytest.raises(aioftp.PassiveResponseError):
+            p(response)
+    # multiple conflicting candidates must not be reduced to "the last one"
+    with pytest.raises(aioftp.PassiveResponseError):
+        p("227 (127,0,0,1,1,0) (10,0,0,1,1,0)")
 
 
 def test_parse_epsv_response():
     p = aioftp.Client.parse_epsv_response
-    assert p("some text (ha-ha) (|||665|) ((((666() (|fd667s).") == (None, 666)
-    assert p("some text (ha-ha) (|||665|) (6666666).") == (None, 666)
+    assert p("some text (ha-ha) (|||665|)") == (None, 665)
+    assert p("some text (ha-ha) (|||665|) (6666666).") == (None, 665)
+    # explicit network protocol and (deprecated) network address are accepted
+    assert p("229 (|1||665|)") == (None, 665)
+    assert p("229 (|2||665|)") == (None, 665)
+    assert p("229 (|||665|)") == (None, 665)
+
+
+def test_parse_epsv_response_strict_rejects_malformed():
+    p = aioftp.Client.parse_epsv_response
+    bad_responses = (
+        "229 nothing here",
+        "229 (|||0|)",  # zero port
+        "229 (|||65536|)",  # port out of range
+        "229 (|||abc|)",  # non-numeric port
+        "229 (|x|665|)",  # wrong field count
+        "229 (1|||665|)",  # digit delimiter is illegal
+        "229 (|||665|) (|||666|)",  # conflicting candidates
+    )
+    for response in bad_responses:
+        with pytest.raises(aioftp.PassiveResponseError):
+            p(response)
+    # duplicate, identical candidates are unambiguous
+    assert p("229 (|||665|) (|||665|)") == (None, 665)
 
 
 def _c_locale_time(d, format="%b %d %H:%M"):

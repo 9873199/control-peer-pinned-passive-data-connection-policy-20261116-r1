@@ -9,6 +9,11 @@ __all__ = (
     "PathIsNotAbsolute",
     "PathIOError",
     "NoAvailablePort",
+    "InvalidCommand",
+    "PassiveResponseError",
+    "DataEndpointNotAllowed",
+    "DataEndpointMismatch",
+    "DataConnectionGenerationError",
 )
 
 
@@ -98,4 +103,40 @@ class NoAvailablePort(AIOFTPException, OSError):
 class InvalidCommand(AIOFTPException, ValueError):
     """
     Raised when command contains illegal characters
+    """
+
+
+class PassiveResponseError(AIOFTPException, ValueError):
+    """
+    Raised when a PASV or EPSV reply is malformed or ambiguous.
+
+    Such an error is a protocol violation, not a sign that the other passive
+    command should be tried, so it must not be swallowed by the passive-command
+    fallback logic.
+    """
+
+
+class DataEndpointNotAllowed(AIOFTPException):
+    """
+    Raised when a passive (PASV/EPSV) reply points at an IP address which is not
+    permitted by the client's :py:class:`aioftp.DataEndpointPolicy`.
+
+    The data connection is never opened to the rejected address.
+    """
+
+
+class DataEndpointMismatch(AIOFTPException):
+    """
+    Raised when a data connection, after being established, turns out to be
+    connected to a different peer than the policy permitted. The data socket is
+    closed before the transfer command (STOR/RETR/...) is sent.
+    """
+
+
+class DataConnectionGenerationError(AIOFTPException):
+    """
+    Raised when a data connection created for an older control-connection
+    generation is used after the control connection has been replaced
+    (reconnected). Both the policy snapshot and the pending data connection are
+    invalidated on reconnect.
     """

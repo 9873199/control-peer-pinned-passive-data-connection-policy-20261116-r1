@@ -166,6 +166,7 @@ Further reading
     server_tutorial
     developer_tutorial
     client_api
+    data_endpoint_security
     server_api
     common_api
     path_io_api

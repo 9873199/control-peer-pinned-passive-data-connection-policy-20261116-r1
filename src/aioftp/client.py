@@ -6,7 +6,7 @@ import logging
 import re
 import ssl
 import sys
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Callable, Sequence
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from types import TracebackType
@@ -39,6 +39,7 @@ from .common import (
     wrap_into_codes,
     wrap_with_container,
 )
+from .policy import DataEndpointPolicy, IpAddressInput
 
 if sys.version_info >= (3, 11):
     from typing import NotRequired, Self, Unpack
@@ -56,6 +57,8 @@ __all__ = (
     "BasicListInfo",
     "Client",
     "DataConnectionThrottleStreamIO",
+    "DataEndpointPolicy",
+    "IpAddressInput",
     "ListInfo",
     "UnixListInfo",
 )
@@ -87,6 +90,7 @@ class DataConnectionThrottleStreamIO(ThrottleStreamIO):
         timeout: float | int | None = None,
         read_timeout: float | int | None = None,
         write_timeout: float | int | None = None,
+        on_close: "Callable[[], None] | None" = None,
     ) -> None:
         super().__init__(
             reader,
@@ -97,6 +101,15 @@ class DataConnectionThrottleStreamIO(ThrottleStreamIO):
             write_timeout=write_timeout,
         )
         self.client = client
+        self._on_close = on_close
+
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            if self._on_close is not None:
+                on_close, self._on_close = self._on_close, None
+                on_close()
 
     async def finish(
         self,
@@ -180,6 +193,9 @@ class BaseClientArgs(TypedDict, total=False):
     parse_list_line_custom_first: bool
     passive_commands: tuple[str, ...]
     siosocks_asyncio_kwargs: Any
+    data_endpoint_policy: DataEndpointPolicy | None
+    data_endpoint_extra_allowed_ips: tuple[IpAddressInput, ...] | None
+    strict_data_endpoints: bool
 
 
 class BaseClient:
@@ -198,6 +214,9 @@ class BaseClient:
         parse_list_line_custom_first: bool = True,
         passive_commands: tuple[str, ...] = ("epsv", "pasv"),
         trust_server_pasv_ipv4_address: bool = False,
+        data_endpoint_policy: DataEndpointPolicy | None = None,
+        data_endpoint_extra_allowed_ips: (tuple[IpAddressInput, ...] | list[IpAddressInput] | None) = None,
+        strict_data_endpoints: bool = True,
         **siosocks_asyncio_kwargs: Any,
     ):
         self.socket_timeout = socket_timeout
@@ -216,9 +235,31 @@ class BaseClient:
         self._passive_commands = passive_commands
         self.trust_server_pasv_ipv4_address = trust_server_pasv_ipv4_address
         self._siosocks_asyncio_kwargs = siosocks_asyncio_kwargs
+        self._data_endpoint_policy_explicit = data_endpoint_policy
+        if data_endpoint_extra_allowed_ips is None:
+            self._data_endpoint_extra_allowed_ips: tuple[IpAddressInput, ...] = ()
+        else:
+            extras = tuple(data_endpoint_extra_allowed_ips)
+            for extra in extras:
+                DataEndpointPolicy.validate_unicast(extra, "data endpoint exception")
+            self._data_endpoint_extra_allowed_ips = extras
+        self.strict_data_endpoints = strict_data_endpoints
+        self._connection_generation = 0
+        self._data_endpoint_policy: DataEndpointPolicy | None = None
+        # Passive data connections created for the current control-connection
+        # generation, keyed by asyncio.StreamWriter. They are all discarded
+        # (closed) when the control connection is replaced.
+        self._passive_data_writers: set[asyncio.StreamWriter] = set()
 
-    async def _open_connection(self, host: str, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    async def _open_connection(
+        self,
+        host: str,
+        port: int,
+        *,
+        server_hostname: str | None = None,
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         ssl_resolved = self.ssl
+        extra_kwargs: dict[str, Any] = {}
         if self._stream is not None:
             ssl_object = self._stream.writer.transport.get_extra_info("ssl_object")
             if ssl_object is not None:
@@ -227,11 +268,17 @@ class BaseClient:
                     context=ssl_object.context,
                     session=ssl_object.session,
                 )
+        if ssl_resolved:
+            # Keep the TLS reference identity of the control connection:
+            # dialling a fixed IP must not turn the certificate reference name
+            # into an IP literal and must never disable verification.
+            extra_kwargs["server_hostname"] = server_hostname if server_hostname is not None else self.server_host
         connection: tuple[asyncio.StreamReader, asyncio.StreamWriter] = await asyncio.wait_for(
             open_connection(
                 host,
                 port,
                 ssl=ssl_resolved,
+                **extra_kwargs,
                 **self._siosocks_asyncio_kwargs,
             ),
             self.connection_timeout,
@@ -242,12 +289,87 @@ class BaseClient:
         self.server_host = host
         self.server_port = port
         reader, writer = await self._open_connection(host, port)
+        self._adopt_control_connection(reader, writer)
+
+    def _adopt_control_connection(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """
+        Install a freshly established control transport and refresh every
+        generation-scoped state: the endpoint-policy snapshot is rebuilt from
+        the actual socket peer and pending data connections are invalidated.
+        """
+        old_stream = self._stream
+        is_new_transport = old_stream is None or writer is not old_stream.writer
+        if old_stream is not None and is_new_transport:
+            old_stream.close()
+        self._invalidate_generation(is_new_transport)
         self._stream = ThrottleStreamIO(
             reader,
             writer,
             throttles={"_": self.throttle},
             timeout=self.socket_timeout,
         )
+        self._data_endpoint_policy = self._build_data_endpoint_policy()
+
+    def _invalidate_generation(self, advance: bool = True) -> None:
+        """
+        Invalidate the policy snapshot and close all passive data connections
+        belonging to the current (or a previous) control-connection generation.
+        """
+        if advance:
+            self._connection_generation += 1
+        stale_writers = self._passive_data_writers
+        self._passive_data_writers = set()
+        for writer in stale_writers:
+            writer.close()
+        self._data_endpoint_policy = None
+
+    def _build_data_endpoint_policy(self) -> DataEndpointPolicy | None:
+        if not self.strict_data_endpoints:
+            return None
+        extras: tuple[IpAddressInput, ...]
+        if self._data_endpoint_policy_explicit is not None:
+            # An explicitly supplied policy is still re-anchored to the actual
+            # peer of this concrete control connection; only its static
+            # exceptions are carried over.
+            extras = tuple(self._data_endpoint_policy_explicit.extra_allowed_ips)
+        else:
+            extras = self._data_endpoint_extra_allowed_ips
+        peer_ip = self._control_peer_ip()
+        if peer_ip is None:
+            return None
+        return DataEndpointPolicy(
+            peer_ip,
+            extra_allowed_ips=extras,
+            generation=self._connection_generation,
+        )
+
+    def _control_peer_ip(self) -> str | None:
+        if self._stream is None:
+            return None
+        peername = self._stream.writer.transport.get_extra_info("peername")
+        if not peername:
+            return None
+        if isinstance(peername, str):
+            return peername
+        return str(peername[0])
+
+    @property
+    def data_endpoint_policy(self) -> DataEndpointPolicy | None:
+        """
+        The policy snapshot bound to the current control-connection generation,
+        or :py:class:`None` when strict binding is disabled.
+        """
+        return self._data_endpoint_policy
+
+    def _register_data_writer(self, writer: asyncio.StreamWriter) -> None:
+        self._passive_data_writers.add(writer)
+
+    def _unregister_data_writer(self, writer: asyncio.StreamWriter) -> None:
+        self._passive_data_writers.discard(writer)
 
     @property
     def stream(self) -> ThrottleStreamIO:
@@ -261,6 +383,10 @@ class BaseClient:
         """
         if self._stream is not None:
             self._stream.close()
+        # The control transport is gone: its policy snapshot and every passive
+        # data connection tied to its generation are no longer valid.
+        self._invalidate_generation(advance=True)
+        self._stream = None
 
     async def parse_line(self) -> tuple[Code, str]:
         """
@@ -403,34 +529,103 @@ class BaseClient:
     @staticmethod
     def parse_epsv_response(s: str) -> tuple[None, int]:
         """
-        Parsing `EPSV` (`message (|||port|)`) response.
+        Parse an `EPSV` response (RFC 2428, ``(|||port|)`` form).
+
+        The reply must be unambiguous: every parenthesized candidate is checked
+        against the EPSV grammar (a single printable-ASCII delimiter, four
+        delimiter-separated fields, numeric port). If several valid candidates
+        with different ports are present the reply is rejected instead of
+        silently picking the last one.
 
         :param s: response line
         :type s: :py:class:`str`
 
-        :return: (ip, port)
+        :return: (ip, port), where ip is always :py:class:`None` because EPSV
+            replies carry no address
         :rtype: (:py:class:`None`, :py:class:`int`)
+
+        :raises aioftp.PassiveResponseError: if no valid candidate exists, the
+            delimiter or field count is illegal, the port is out of range, or
+            multiple conflicting candidates are present
         """
-        matches = tuple(re.finditer(r"\((.)\1\1\d+\1\)", s))
-        s = matches[-1].group()
-        port = int(s[4:-2])
-        return None, port
+        candidates: list[int] = []
+        for match in re.finditer(r"\(([^()]*)\)", s):
+            inner = match.group(1)
+            if len(inner) < 5:
+                continue
+            delim = inner[0]
+            if not (33 <= ord(delim) <= 126) or delim.isdigit():
+                continue
+            fields = inner.split(delim)
+            # "(<d><proto><d><addr><d><port><d>)" splits into five parts with
+            # the first and last one empty.
+            if len(fields) != 5 or fields[0] != "" or fields[4] != "":
+                continue
+            protocol, address, port_text = fields[1], fields[2], fields[3]
+            if protocol not in ("", "1", "2") or address != "":
+                continue
+            if not port_text.isdigit():
+                continue
+            port = int(port_text)
+            DataEndpointPolicy.check_port(port)
+            candidates.append(port)
+        if not candidates:
+            raise errors.PassiveResponseError(f"no valid EPSV candidate in response {s!r}")
+        if len(set(candidates)) != 1:
+            raise errors.PassiveResponseError(
+                f"ambiguous EPSV response with conflicting candidates: {s!r}",
+            )
+        return None, candidates[0]
 
     @staticmethod
     def parse_pasv_response(s: str) -> tuple[str, int]:
         """
-        Parsing `PASV` server response.
+        Parse a `PASV` server response strictly.
+
+        The reply must contain exactly one parenthesized PASV candidate holding
+        six comma-separated integers, each in the 0..255 range. Out-of-range
+        integers, wrong field counts, non-numeric fields, ports outside
+        1..65535 and multiple conflicting candidates are rejected.
 
         :param s: response line
         :type s: :py:class:`str`
 
         :return: (ip, port)
         :rtype: (:py:class:`str`, :py:class:`int`)
+
+        :raises aioftp.PassiveResponseError: if the reply is malformed or
+            ambiguous
         """
-        sub, *_ = re.findall(r"[^(]*\(([^)]*)", s)
-        nums = tuple(map(int, sub.split(",")))
+        groups = re.findall(r"\(([^()]*)\)", s)
+        pasv_groups = [group for group in groups if "," in group]
+        if not pasv_groups:
+            raise errors.PassiveResponseError(f"no valid PASV candidate in response {s!r}")
+        parsed: list[list[int]] = []
+        for group in pasv_groups:
+            fields = group.split(",")
+            if len(fields) != 6:
+                raise errors.PassiveResponseError(
+                    f"PASV response must contain six integers, got {len(fields)}: {s!r}",
+                )
+            nums: list[int] = []
+            for field in fields:
+                if not field.isdigit():
+                    raise errors.PassiveResponseError(f"non-numeric PASV field {field!r} in {s!r}")
+                value = int(field)
+                if not 0 <= value <= 255:
+                    raise errors.PassiveResponseError(
+                        f"PASV integer {value} out of 0..255 range in {s!r}",
+                    )
+                nums.append(value)
+            parsed.append(nums)
+        if len(parsed) != 1:
+            raise errors.PassiveResponseError(
+                f"ambiguous PASV response with conflicting candidates: {s!r}",
+            )
+        nums = parsed[0]
         ip = ".".join(map(str, nums[:4]))
         port = (nums[4] << 8) | nums[5]
+        DataEndpointPolicy.check_port(port)
         return ip, port
 
     @staticmethod
@@ -1320,7 +1515,11 @@ class Client(BaseClient):
         code, info = await self.command("PASV", "227")
         ip: str | None
         ip, port = self.parse_pasv_response(info[-1])
-        if not self.trust_server_pasv_ipv4_address:
+        if not self.strict_data_endpoints and not self.trust_server_pasv_ipv4_address:
+            # Legacy behavior: ignore the server-supplied address and fall
+            # back to the original hostname. In strict mode the parsed address
+            # is always returned so that get_passive_connection can run it
+            # through the endpoint policy.
             ip = None
         return ip, port
 
@@ -1334,6 +1533,16 @@ class Client(BaseClient):
 
         Getting pair of reader, writer for passive connection with server.
 
+        When strict data endpoint binding is enabled (the default), the data
+        connection is only opened to the IP address anchored to the current
+        control-connection socket peer (or an explicitly configured static
+        exception). The original hostname is never re-resolved for the data
+        connection, PASV addresses must pass the policy, and after the
+        connection is established the transport's real peer is verified again.
+        Malformed passive replies and policy rejections are fatal and do not
+        trigger a fallback to the other passive command; only a genuine
+        "command not implemented" (``50x``) reply allows trying the next one.
+
         :param conn_type: connection type ("I", "A", "E", "L")
         :type conn_type: :py:class:`str`
 
@@ -1344,6 +1553,15 @@ class Client(BaseClient):
 
         :rtype: (:py:class:`asyncio.StreamReader`,
             :py:class:`asyncio.StreamWriter`)
+
+        :raises aioftp.PassiveResponseError: malformed or ambiguous passive
+            reply
+        :raises aioftp.DataEndpointNotAllowed: policy rejected the endpoint
+            before dialling
+        :raises aioftp.DataEndpointMismatch: the established data transport is
+            connected to a different peer than permitted
+        :raises aioftp.DataConnectionGenerationError: the control connection
+            was replaced while opening the data connection
         """
         functions = {
             "epsv": self._do_epsv,
@@ -1353,8 +1571,11 @@ class Client(BaseClient):
             commands = self._passive_commands
         if not commands:
             raise ValueError("No passive commands provided")
+        generation = self._connection_generation
+        policy = self._data_endpoint_policy
         await self.command("TYPE " + conn_type, "200")
         ip: str | None
+        port: int
         for i, name in enumerate(commands, start=1):
             name = name.lower()
             if name not in functions:
@@ -1363,12 +1584,47 @@ class Client(BaseClient):
                 ip, port = await functions[name]()
                 break
             except errors.StatusCodeError as e:
+                # Only a real "command not implemented" style 50x reply allows
+                # trying the next passive mechanism. Parse errors
+                # (PassiveResponseError) and policy rejections are not caught
+                # here and therefore cannot be bypassed via fallback.
                 is_last = i == len(commands)
                 if is_last or not e.received_codes[-1].matches("50x"):
                     raise
-        if ip is None or ip == "0.0.0.0":
-            ip = self.server_host
-        reader, writer = await self._open_connection(ip, port)
+        if self._connection_generation != generation:
+            raise errors.DataConnectionGenerationError(
+                "control connection was replaced while negotiating a passive connection",
+            )
+        target_ip: str
+        if policy is not None:
+            DataEndpointPolicy.check_port(port)
+            if ip is None:
+                # EPSV: the reply carries no address, so anchor to the peer.
+                target_ip = str(policy.peer_ip)
+            else:
+                # PASV: the supplied address must pass the policy, including
+                # the IPv6 family check and the 0.0.0.0 compatibility rule.
+                policy.check_family(ip)
+                target_ip = str(policy.resolve_pasv_address(ip))
+        else:
+            # Legacy, non-strict behavior.
+            if ip is None or ip == "0.0.0.0":
+                ip = self.server_host
+            target_ip = ip
+        reader, writer = await self._open_connection(target_ip, port)
+        try:
+            if self._connection_generation != generation:
+                writer.close()
+                raise errors.DataConnectionGenerationError(
+                    "control connection was replaced while opening a data connection",
+                )
+            if policy is not None:
+                peername = writer.transport.get_extra_info("peername")
+                policy.verify_connected_peer(peername)
+        except BaseException:
+            writer.close()
+            raise
+        self._register_data_writer(writer)
         return reader, writer
 
     @async_enterable
@@ -1387,6 +1643,12 @@ class Client(BaseClient):
         Create :py:class:`aioftp.DataConnectionThrottleStreamIO` for straight
         read/write io.
 
+        The endpoint policy is enforced inside
+        :py:meth:`aioftp.Client.get_passive_connection`, so the peer check
+        completes before STOR/RETR/LIST (and any file payload) is sent. On
+        failure or cancellation only this task's data connection is cleaned
+        up; other clients and unrelated connections are untouched.
+
         :param command_args: arguments for :py:meth:`aioftp.Client.command`
 
         :param conn_type: connection type ("I", "A", "E", "L")
@@ -1397,16 +1659,27 @@ class Client(BaseClient):
 
         :rtype: :py:class:`aioftp.DataConnectionThrottleStreamIO`
         """
+        generation = self._connection_generation
         reader, writer = await self.get_passive_connection(conn_type)
-        if offset:
-            await self.command("REST " + str(offset), "350")
-        await self.command(command, expected_codes, wait_codes, censor_after)
+        try:
+            if self._connection_generation != generation:
+                raise errors.DataConnectionGenerationError(
+                    "control connection was replaced before the transfer command",
+                )
+            if offset:
+                await self.command("REST " + str(offset), "350")
+            await self.command(command, expected_codes, wait_codes, censor_after)
+        except BaseException:
+            self._unregister_data_writer(writer)
+            writer.close()
+            raise
         stream = DataConnectionThrottleStreamIO(
             self,
             reader,
             writer,
             throttles={"_": self.throttle},
             timeout=self.socket_timeout,
+            on_close=lambda: self._unregister_data_writer(writer),
         )
         return stream
 

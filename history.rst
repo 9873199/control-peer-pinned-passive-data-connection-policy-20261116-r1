@@ -1,3 +1,14 @@
+0.29.0 (unreleased)
+-------------------
+- add strict data endpoint binding policy for passive (PASV/EPSV) data connections
+- the policy anchors data connections to the canonical IP of the actual control-connection socket peer; the hostname is never re-resolved for the data channel
+- add `data_endpoint_policy`, `data_endpoint_extra_allowed_ips` and `strict_data_endpoints` client parameters; strict mode is on by default and the legacy behavior remains available via `strict_data_endpoints=False`
+- PASV/EPSV replies are parsed strictly: six 0..255 PASV integers, legal EPSV delimiter/fields, unambiguous single candidates, ports in 1..65535; malformed replies and policy rejections no longer trigger passive-command fallback
+- reject multicast and unspecified data endpoints; treat `0.0.0.0` as the current control peer; forbid IPv6-to-IPv4 family downgrade via PASV; compare IPv4-mapped IPv6 addresses with unified semantics
+- verify the connected data transport peer again after dialling and close the socket on mismatch before any STOR/RETR/payload
+- control-connection reconnects invalidate the policy snapshot and close pending passive data connections
+- FTPS data dials keep the control connection hostname as the TLS reference identity and never weaken certificate verification
+
 0.28.3 (2026-09-19)
 -------------------
 - client `is_dir` should treat `cdir` and `pdir` as a directory too, according to RFC3659 (fixes #211)
